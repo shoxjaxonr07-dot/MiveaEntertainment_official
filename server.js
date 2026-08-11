@@ -30,7 +30,9 @@ db.exec(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
 const app = express();
 app.use(cors());
 app.use(express.json());
-
+app.get("/", (req, res) => {
+  res.json({ message: "MIVEA Entertainment API is running!" });
+});
 /* ---------------- helpers ---------------- */
 const CATEGORY_KEYS = ['vocal','dance','rap','acting','allround','music'];
 const STATUS_ORDER = ['SUBMITTED','UNDER_REVIEW','SHORTLISTED','ONLINE_AUDITION','FINAL_EVALUATION','ACCEPTED','NOT_SELECTED'];
