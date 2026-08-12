@@ -21,6 +21,8 @@ const path = require('path');
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const PORT = process.env.PORT || 4000;
 const DB_PATH = path.join(__dirname, 'mivea.db');
+const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
+const EMAIL_FROM = process.env.EMAIL_FROM || 'MIVEA Entertainment <onboarding@resend.dev>';
 
 const isNewDb = !fs.existsSync(DB_PATH);
 const db = new Database(DB_PATH);
@@ -30,9 +32,7 @@ db.exec(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.get("/", (req, res) => {
-  res.json({ message: "MIVEA Entertainment API is running!" });
-});
+
 /* ---------------- helpers ---------------- */
 const CATEGORY_KEYS = ['vocal','dance','rap','acting','allround','music'];
 const STATUS_ORDER = ['SUBMITTED','UNDER_REVIEW','SHORTLISTED','ONLINE_AUDITION','FINAL_EVALUATION','ACCEPTED','NOT_SELECTED'];
@@ -40,6 +40,55 @@ const STATUS_ORDER = ['SUBMITTED','UNDER_REVIEW','SHORTLISTED','ONLINE_AUDITION'
 function genAppId() {
   const n = Math.floor(10000 + Math.random() * 89999);
   return 'MV-2026-' + n;
+}
+
+/* ---------------- EMAIL (Resend) ---------------- */
+async function sendEmail(to, subject, html) {
+  if (!RESEND_API_KEY) {
+    console.log(`[email skipped — no RESEND_API_KEY] would send "${subject}" to ${to}`);
+    return;
+  }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ from: EMAIL_FROM, to: [to], subject, html })
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      console.error('Resend error:', res.status, errText);
+    }
+  } catch (err) {
+    console.error('Failed to send email:', err.message);
+  }
+}
+
+const STATUS_EMAIL_TEXT = {
+  UNDER_REVIEW: "Your application is now under review by our casting team.",
+  SHORTLISTED: "Congratulations — you've been shortlisted!",
+  ONLINE_AUDITION: "You've been invited to an online audition round.",
+  FINAL_EVALUATION: "Your application has reached final evaluation.",
+  ACCEPTED: "Congratulations — you've been accepted!",
+  NOT_SELECTED: "Thank you for auditioning. We won't be moving forward with your application at this time."
+};
+
+/* ---------------- RATE LIMITING ---------------- */
+const rateLimitBuckets = new Map();
+function rateLimit(maxRequests, windowMs) {
+  return (req, res, next) => {
+    const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    const timestamps = (rateLimitBuckets.get(ip) || []).filter(t => now - t < windowMs);
+    if (timestamps.length >= maxRequests) {
+      return res.status(429).json({ error: 'Too many requests — please try again later.' });
+    }
+    timestamps.push(now);
+    rateLimitBuckets.set(ip, timestamps);
+    next();
+  };
 }
 
 function requireAuth(req, res, next) {
@@ -63,8 +112,7 @@ function requireRole(...roles) {
 
 /* ================= PUBLIC ROUTES ================= */
 
-// Create an audition application
-app.post('/api/v1/applications', (req, res) => {
+app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), (req, res) => {
   const b = req.body || {};
   const required = ['fullName','dob','country','email','category','why','strengths','languages'];
   for (const f of required) {
@@ -89,11 +137,18 @@ app.post('/api/v1/applications', (req, res) => {
     experience: b.experience || null, languages: b.languages
   });
 
-  // In production: enqueue confirmation email here instead of sending inline.
+  sendEmail(
+    b.email,
+    'MIVEA Entertainment — Application Received',
+    `<p>Hi ${b.fullName},</p>
+     <p>Thank you for auditioning for MIVEA Entertainment. Your application has been received.</p>
+     <p><b>Your Application ID: ${id}</b></p>
+     <p>Keep this ID safe — you'll need it along with your email to check your status.</p>`
+  );
+
   res.status(201).json({ id });
 });
 
-// Public status check — narrow shape only, no staff_note, no other applicants
 app.get('/api/v1/applications/status', (req, res) => {
   const { id, email } = req.query;
   if (!id || !email) return res.status(400).json({ error: 'id and email are required' });
@@ -102,7 +157,7 @@ app.get('/api/v1/applications/status', (req, res) => {
   res.json(row);
 });
 
-app.post('/api/v1/contact', (req, res) => {
+app.post('/api/v1/contact', rateLimit(10, 60 * 60 * 1000), (req, res) => {
   const b = req.body || {};
   if (!b.name || !b.email || !b.message) return res.status(400).json({ error: 'name, email, and message are required' });
   db.prepare(`INSERT INTO contact_messages (id, name, email, subject, message) VALUES (?,?,?,?,?)`)
@@ -162,8 +217,18 @@ app.patch('/api/v1/applications/:id', requireAuth, (req, res) => {
   if (!existing) return res.status(404).json({ error: 'Not found' });
   db.prepare(`UPDATE applications SET status = COALESCE(?, status), staff_note = COALESCE(?, staff_note), updated_at = datetime('now') WHERE id = ?`)
     .run(status || null, staffNote ?? null, req.params.id);
-  // In production: enqueue a status-change notification email here.
-  res.json(db.prepare('SELECT * FROM applications WHERE id = ?').get(req.params.id));
+
+  const updatedRow = db.prepare('SELECT * FROM applications WHERE id = ?').get(req.params.id);
+
+  if (status && status !== existing.status && STATUS_EMAIL_TEXT[status]) {
+    sendEmail(
+      updatedRow.email,
+      `MIVEA Entertainment — Application Update (${updatedRow.id})`,
+      `<p>Hi ${updatedRow.full_name},</p><p>${STATUS_EMAIL_TEXT[status]}</p>`
+    );
+  }
+
+  res.json(updatedRow);
 });
 
 app.get('/api/v1/artists/all', requireAuth, (req, res) => {
@@ -218,15 +283,42 @@ app.delete('/api/v1/news/:id', requireAuth, (req, res) => {
   res.status(204).end();
 });
 
+app.get('/api/v1/contact-messages', requireAuth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM contact_messages ORDER BY created_at DESC').all());
+});
+
+app.patch('/api/v1/contact-messages/:id', requireAuth, (req, res) => {
+  const existing = db.prepare('SELECT * FROM contact_messages WHERE id = ?').get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE contact_messages SET read = 1 WHERE id = ?').run(req.params.id);
+  res.json(db.prepare('SELECT * FROM contact_messages WHERE id = ?').get(req.params.id));
+});
+
 app.get('/api/v1/staff', requireAuth, requireRole('administrator'), (req, res) => {
   res.json(db.prepare('SELECT id, name, email, role, created_at FROM staff').all());
 });
 
-app.get('/api/v1/contact-messages', requireAuth, (req, res) => {
-  res.json(db.prepare('SELECT * FROM contact_messages ORDER BY created_at DESC').all());
+app.post('/api/v1/staff', requireAuth, requireRole('administrator'), (req, res) => {
+  const b = req.body || {};
+  if (!b.name || !b.email || !b.password || !b.role) {
+    return res.status(400).json({ error: 'name, email, password, and role are required' });
+  }
+  if (!['administrator', 'reviewer', 'editor'].includes(b.role)) {
+    return res.status(400).json({ error: 'Invalid role' });
+  }
+  if (db.prepare('SELECT id FROM staff WHERE email = ?').get(b.email)) {
+    return res.status(409).json({ error: 'A staff account with this email already exists' });
+  }
+  const id = uuidv4();
+  const hash = bcrypt.hashSync(b.password, 10);
+  db.prepare('INSERT INTO staff (id, name, email, password_hash, role) VALUES (?,?,?,?,?)')
+    .run(id, b.name, b.email, hash, b.role);
+  res.status(201).json({ id, name: b.name, email: b.email, role: b.role });
 });
 
 app.listen(PORT, () => {
   console.log(`MIVEA reference API listening on http://localhost:${PORT}`);
   if (isNewDb) console.log('New database created — run "npm run seed" to add a demo staff login.');
 });
+
+
