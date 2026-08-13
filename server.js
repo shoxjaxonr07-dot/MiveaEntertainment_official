@@ -29,6 +29,21 @@ const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.exec(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
 
+// Self-seed the demo staff account on every startup, regardless of whether
+// the platform's Build Command remembered to run the separate seed script.
+// This makes the demo login (admin@mivea.demo / mivea2026) reliable no
+// matter how the hosting platform is configured.
+(function ensureDemoStaffAccount(){
+  const email = 'admin@mivea.demo';
+  const existing = db.prepare('SELECT id FROM staff WHERE email = ?').get(email);
+  if (!existing) {
+    const hash = bcrypt.hashSync('mivea2026', 10);
+    db.prepare('INSERT INTO staff (id, name, email, password_hash, role) VALUES (?,?,?,?,?)')
+      .run(uuidv4(), 'Demo Admin', email, hash, 'administrator');
+    console.log('Demo staff account created automatically:', email);
+  }
+})();
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -43,6 +58,9 @@ function genAppId() {
 }
 
 /* ---------------- EMAIL (Resend) ---------------- */
+// Fire-and-forget: a slow or missing email provider should never block
+// the applicant's response. Logs to console instead of crashing if
+// RESEND_API_KEY isn't set, so the app still works without it.
 async function sendEmail(to, subject, html) {
   if (!RESEND_API_KEY) {
     console.log(`[email skipped — no RESEND_API_KEY] would send "${subject}" to ${to}`);
@@ -76,6 +94,8 @@ const STATUS_EMAIL_TEXT = {
 };
 
 /* ---------------- RATE LIMITING ---------------- */
+// Simple in-memory limiter — fine for a single instance. If this ever runs
+// on multiple instances, swap for a shared store (e.g. Redis).
 const rateLimitBuckets = new Map();
 function rateLimit(maxRequests, windowMs) {
   return (req, res, next) => {
@@ -112,6 +132,7 @@ function requireRole(...roles) {
 
 /* ================= PUBLIC ROUTES ================= */
 
+// Create an audition application
 app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), (req, res) => {
   const b = req.body || {};
   const required = ['fullName','dob','country','email','category','why','strengths','languages'];
@@ -137,6 +158,7 @@ app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), (req, res) => {
     experience: b.experience || null, languages: b.languages
   });
 
+  // Confirmation email — fire-and-forget, doesn't block the response.
   sendEmail(
     b.email,
     'MIVEA Entertainment — Application Received',
@@ -149,6 +171,7 @@ app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), (req, res) => {
   res.status(201).json({ id });
 });
 
+// Public status check — narrow shape only, no staff_note, no other applicants
 app.get('/api/v1/applications/status', (req, res) => {
   const { id, email } = req.query;
   if (!id || !email) return res.status(400).json({ error: 'id and email are required' });
@@ -320,5 +343,3 @@ app.listen(PORT, () => {
   console.log(`MIVEA reference API listening on http://localhost:${PORT}`);
   if (isNewDb) console.log('New database created — run "npm run seed" to add a demo staff login.');
 });
-
-
