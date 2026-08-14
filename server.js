@@ -13,6 +13,7 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 const Database = require('better-sqlite3');
 const fs = require('fs');
@@ -23,6 +24,7 @@ const PORT = process.env.PORT || 4000;
 const DB_PATH = path.join(__dirname, 'mivea.db');
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
 const EMAIL_FROM = process.env.EMAIL_FROM || 'MIVEA Entertainment <onboarding@resend.dev>';
+const IMAGEKIT_PRIVATE_KEY = process.env.IMAGEKIT_PRIVATE_KEY || null;
 
 const isNewDb = !fs.existsSync(DB_PATH);
 const db = new Database(DB_PATH);
@@ -131,6 +133,17 @@ function requireRole(...roles) {
 }
 
 /* ================= PUBLIC ROUTES ================= */
+
+// Issues a short-lived signature so the browser can upload directly to
+// ImageKit without ever seeing the private key. Standard ImageKit
+// client-side upload auth pattern (token + expire + HMAC-SHA1 signature).
+app.get('/api/v1/upload-auth', (req, res) => {
+  if (!IMAGEKIT_PRIVATE_KEY) return res.status(503).json({ error: 'Image upload is not configured on this server yet.' });
+  const token = crypto.randomUUID();
+  const expire = Math.floor(Date.now() / 1000) + 2400; // 40 minutes
+  const signature = crypto.createHmac('sha1', IMAGEKIT_PRIVATE_KEY).update(token + expire).digest('hex');
+  res.json({ token, expire, signature });
+});
 
 // Create an audition application
 app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), (req, res) => {
