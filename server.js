@@ -1,13 +1,9 @@
-/**
- * MIVEA Entertainment — reference API server
- * Express + better-sqlite3. Minimal, readable, meant to be extended —
- * not a production deployment (see BACKEND-DESIGN.md for the real shape:
- * Postgres, S3 pre-signed uploads, a queued email worker, etc).
+ /**
+ * MIVEA Entertainment — reference API server (PostgreSQL edition)
+ * Express + pg (node-postgres). Data now persists across restarts/redeploys —
+ * this replaces the earlier SQLite version.
  *
- * Run:
- *   npm install
- *   npm run seed     # creates mivea.db and a demo staff account
- *   npm start         # http://localhost:4000
+ * Requires a DATABASE_URL environment variable (a Postgres connection string).
  */
 const express = require('express');
 const cors = require('cors');
@@ -15,40 +11,52 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const fs = require('fs');
 const path = require('path');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const PORT = process.env.PORT || 4000;
-const DB_PATH = path.join(__dirname, 'mivea.db');
 const RESEND_API_KEY = process.env.RESEND_API_KEY || null;
 const EMAIL_FROM = process.env.EMAIL_FROM || 'MIVEA Entertainment <onboarding@resend.dev>';
 const IMAGEKIT_PRIVATE_KEY = process.env.IMAGEKIT_PRIVATE_KEY || null;
+const DATABASE_URL = process.env.DATABASE_URL;
 
-const isNewDb = !fs.existsSync(DB_PATH);
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
-db.exec(fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8'));
+if (!DATABASE_URL) {
+  console.error('DATABASE_URL is not set — add your Postgres connection string as an environment variable.');
+  process.exit(1);
+}
 
-// Self-seed the demo staff account on every startup, regardless of whether
-// the platform's Build Command remembered to run the separate seed script.
-// This makes the demo login (admin@mivea.demo / mivea2026) reliable no
-// matter how the hosting platform is configured.
-(function ensureDemoStaffAccount(){
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+async function initDb() {
+  const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
+  await pool.query(schema);
+
+  // Self-seed the demo staff account on every startup so the demo login
+  // (admin@mivea.demo / mivea2026) always works, however the platform is configured.
   const email = 'admin@mivea.demo';
-  const existing = db.prepare('SELECT id FROM staff WHERE email = ?').get(email);
-  if (!existing) {
+  const { rows } = await pool.query('SELECT id FROM staff WHERE email = $1', [email]);
+  if (rows.length === 0) {
     const hash = bcrypt.hashSync('mivea2026', 10);
-    db.prepare('INSERT INTO staff (id, name, email, password_hash, role) VALUES (?,?,?,?,?)')
-      .run(uuidv4(), 'Demo Admin', email, hash, 'administrator');
+    await pool.query(
+      'INSERT INTO staff (id, name, email, password_hash, role) VALUES ($1,$2,$3,$4,$5)',
+      [uuidv4(), 'Demo Admin', email, hash, 'administrator']
+    );
     console.log('Demo staff account created automatically:', email);
   }
-})();
+}
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Wraps an async route handler so a rejected promise becomes a proper
+// 500 response instead of crashing the process.
+const ah = (fn) => (req, res, next) => fn(req, res, next).catch(next);
 
 /* ---------------- helpers ---------------- */
 const CATEGORY_KEYS = ['vocal','dance','rap','acting','allround','music'];
@@ -60,9 +68,6 @@ function genAppId() {
 }
 
 /* ---------------- EMAIL (Resend) ---------------- */
-// Fire-and-forget: a slow or missing email provider should never block
-// the applicant's response. Logs to console instead of crashing if
-// RESEND_API_KEY isn't set, so the app still works without it.
 async function sendEmail(to, subject, html) {
   if (!RESEND_API_KEY) {
     console.log(`[email skipped — no RESEND_API_KEY] would send "${subject}" to ${to}`);
@@ -71,16 +76,10 @@ async function sendEmail(to, subject, html) {
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${RESEND_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ from: EMAIL_FROM, to: [to], subject, html })
     });
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error('Resend error:', res.status, errText);
-    }
+    if (!res.ok) console.error('Resend error:', res.status, await res.text());
   } catch (err) {
     console.error('Failed to send email:', err.message);
   }
@@ -96,17 +95,13 @@ const STATUS_EMAIL_TEXT = {
 };
 
 /* ---------------- RATE LIMITING ---------------- */
-// Simple in-memory limiter — fine for a single instance. If this ever runs
-// on multiple instances, swap for a shared store (e.g. Redis).
 const rateLimitBuckets = new Map();
 function rateLimit(maxRequests, windowMs) {
   return (req, res, next) => {
     const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
     const now = Date.now();
     const timestamps = (rateLimitBuckets.get(ip) || []).filter(t => now - t < windowMs);
-    if (timestamps.length >= maxRequests) {
-      return res.status(429).json({ error: 'Too many requests — please try again later.' });
-    }
+    if (timestamps.length >= maxRequests) return res.status(429).json({ error: 'Too many requests — please try again later.' });
     timestamps.push(now);
     rateLimitBuckets.set(ip, timestamps);
     next();
@@ -117,12 +112,8 @@ function requireAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Missing token' });
-  try {
-    req.staff = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid or expired token' });
-  }
+  try { req.staff = jwt.verify(token, JWT_SECRET); next(); }
+  catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
 }
 
 function requireRole(...roles) {
@@ -134,19 +125,15 @@ function requireRole(...roles) {
 
 /* ================= PUBLIC ROUTES ================= */
 
-// Issues a short-lived signature so the browser can upload directly to
-// ImageKit without ever seeing the private key. Standard ImageKit
-// client-side upload auth pattern (token + expire + HMAC-SHA1 signature).
 app.get('/api/v1/upload-auth', (req, res) => {
   if (!IMAGEKIT_PRIVATE_KEY) return res.status(503).json({ error: 'Image upload is not configured on this server yet.' });
   const token = crypto.randomUUID();
-  const expire = Math.floor(Date.now() / 1000) + 2400; // 40 minutes
+  const expire = Math.floor(Date.now() / 1000) + 2400;
   const signature = crypto.createHmac('sha1', IMAGEKIT_PRIVATE_KEY).update(token + expire).digest('hex');
   res.json({ token, expire, signature });
 });
 
-// Create an audition application
-app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), (req, res) => {
+app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), ah(async (req, res) => {
   const b = req.body || {};
   const required = ['fullName','dob','country','email','category','why','strengths','languages'];
   for (const f of required) {
@@ -156,22 +143,16 @@ app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), (req, res) => {
   if (!b.video) return res.status(400).json({ error: 'Audition video is required' });
 
   const id = genAppId();
-  db.prepare(`
-    INSERT INTO applications
+  await pool.query(
+    `INSERT INTO applications
       (id, full_name, stage_name, date_of_birth, country, city, email, phone, category,
        photo_url, video_url, video2_url, portfolio_url, why_mivea, strengths, experience, languages)
-    VALUES (@id, @fullName, @stageName, @dob, @country, @city, @email, @phone, @category,
-            @photo, @video, @video2, @portfolio, @why, @strengths, @experience, @languages)
-  `).run({
-    id,
-    fullName: b.fullName, stageName: b.stageName || null, dob: b.dob,
-    country: b.country, city: b.city || null, email: b.email, phone: b.phone || null,
-    category: b.category, photo: b.photo || null, video: b.video, video2: b.video2 || null,
-    portfolio: b.portfolio || null, why: b.why, strengths: b.strengths,
-    experience: b.experience || null, languages: b.languages
-  });
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+    [id, b.fullName, b.stageName || null, b.dob, b.country, b.city || null, b.email, b.phone || null,
+     b.category, b.photo || null, b.video, b.video2 || null, b.portfolio || null, b.why, b.strengths,
+     b.experience || null, b.languages]
+  );
 
-  // Confirmation email — fire-and-forget, doesn't block the response.
   sendEmail(
     b.email,
     'MIVEA Entertainment — Application Received',
@@ -182,159 +163,189 @@ app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), (req, res) => {
   );
 
   res.status(201).json({ id });
-});
+}));
 
-// Public status check — narrow shape only, no staff_note, no other applicants
-app.get('/api/v1/applications/status', (req, res) => {
+app.get('/api/v1/applications/status', ah(async (req, res) => {
   const { id, email } = req.query;
   if (!id || !email) return res.status(400).json({ error: 'id and email are required' });
-  const row = db.prepare('SELECT id, status FROM applications WHERE id = ? AND lower(email) = lower(?)').get(id, email);
-  if (!row) return res.status(404).json({ error: 'Not found' });
-  res.json(row);
-});
+  const { rows } = await pool.query(
+    'SELECT id, status FROM applications WHERE id = $1 AND lower(email) = lower($2)',
+    [id, email]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+  res.json(rows[0]);
+}));
 
-app.post('/api/v1/contact', rateLimit(10, 60 * 60 * 1000), (req, res) => {
+app.post('/api/v1/contact', rateLimit(10, 60 * 60 * 1000), ah(async (req, res) => {
   const b = req.body || {};
   if (!b.name || !b.email || !b.message) return res.status(400).json({ error: 'name, email, and message are required' });
-  db.prepare(`INSERT INTO contact_messages (id, name, email, subject, message) VALUES (?,?,?,?,?)`)
-    .run(uuidv4(), b.name, b.email, b.subject || null, b.message);
+  await pool.query(
+    'INSERT INTO contact_messages (id, name, email, subject, message) VALUES ($1,$2,$3,$4,$5)',
+    [uuidv4(), b.name, b.email, b.subject || null, b.message]
+  );
   res.status(201).json({ ok: true });
-});
+}));
 
-app.get('/api/v1/artists', (req, res) => {
+app.get('/api/v1/artists', ah(async (req, res) => {
   const type = req.query.type;
-  let rows = db.prepare('SELECT * FROM artists WHERE published = 1 ORDER BY created_at DESC').all();
-  if (type) rows = rows.filter(r => r.type === type);
+  let sql = 'SELECT * FROM artists WHERE published = true';
+  const params = [];
+  if (type) { params.push(type); sql += ` AND type = $${params.length}`; }
+  sql += ' ORDER BY created_at DESC';
+  const { rows } = await pool.query(sql, params);
   res.json(rows);
-});
+}));
 
-app.get('/api/v1/news', (req, res) => {
+app.get('/api/v1/news', ah(async (req, res) => {
   const tag = req.query.tag;
-  let rows = db.prepare('SELECT * FROM news WHERE published = 1 ORDER BY published_at DESC').all();
-  if (tag) rows = rows.filter(r => r.tag === tag);
+  let sql = 'SELECT * FROM news WHERE published = true';
+  const params = [];
+  if (tag) { params.push(tag); sql += ` AND tag = $${params.length}`; }
+  sql += ' ORDER BY published_at DESC';
+  const { rows } = await pool.query(sql, params);
   res.json(rows);
-});
+}));
 
 /* ================= AUTH ================= */
 
-app.post('/api/v1/auth/login', (req, res) => {
+app.post('/api/v1/auth/login', ah(async (req, res) => {
   const { email, password } = req.body || {};
-  const staff = db.prepare('SELECT * FROM staff WHERE email = ?').get(email);
+  const { rows } = await pool.query('SELECT * FROM staff WHERE email = $1', [email]);
+  const staff = rows[0];
   if (!staff || !bcrypt.compareSync(password || '', staff.password_hash)) {
     return res.status(401).json({ error: 'Incorrect email or password' });
   }
   const token = jwt.sign({ id: staff.id, name: staff.name, role: staff.role }, JWT_SECRET, { expiresIn: '8h' });
   res.json({ token, staff: { id: staff.id, name: staff.name, role: staff.role, email: staff.email } });
-});
+}));
 
 /* ================= STAFF ROUTES ================= */
 
-app.get('/api/v1/applications', requireAuth, (req, res) => {
+app.get('/api/v1/applications', requireAuth, ah(async (req, res) => {
   const { status, category, q } = req.query;
   let sql = 'SELECT * FROM applications WHERE 1=1';
   const params = [];
-  if (status) { sql += ' AND status = ?'; params.push(status); }
-  if (category) { sql += ' AND category = ?'; params.push(category); }
-  if (q) { sql += ' AND (full_name LIKE ? OR id LIKE ?)'; params.push(`%${q}%`, `%${q}%`); }
+  if (status) { params.push(status); sql += ` AND status = $${params.length}`; }
+  if (category) { params.push(category); sql += ` AND category = $${params.length}`; }
+  if (q) { params.push(`%${q}%`); sql += ` AND (full_name ILIKE $${params.length} OR id ILIKE $${params.length})`; }
   sql += ' ORDER BY submitted_at DESC';
-  res.json(db.prepare(sql).all(...params));
-});
+  const { rows } = await pool.query(sql, params);
+  res.json(rows);
+}));
 
-app.get('/api/v1/applications/:id', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT * FROM applications WHERE id = ?').get(req.params.id);
-  if (!row) return res.status(404).json({ error: 'Not found' });
-  res.json(row);
-});
+app.get('/api/v1/applications/:id', requireAuth, ah(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM applications WHERE id = $1', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+  res.json(rows[0]);
+}));
 
-app.patch('/api/v1/applications/:id', requireAuth, (req, res) => {
+app.patch('/api/v1/applications/:id', requireAuth, ah(async (req, res) => {
   const { status, staffNote } = req.body || {};
   if (status && !STATUS_ORDER.includes(status)) return res.status(400).json({ error: 'Invalid status' });
-  const existing = db.prepare('SELECT * FROM applications WHERE id = ?').get(req.params.id);
+  const { rows: existingRows } = await pool.query('SELECT * FROM applications WHERE id = $1', [req.params.id]);
+  const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: 'Not found' });
-  db.prepare(`UPDATE applications SET status = COALESCE(?, status), staff_note = COALESCE(?, staff_note), updated_at = datetime('now') WHERE id = ?`)
-    .run(status || null, staffNote ?? null, req.params.id);
 
-  const updatedRow = db.prepare('SELECT * FROM applications WHERE id = ?').get(req.params.id);
+  await pool.query(
+    `UPDATE applications SET status = COALESCE($1, status), staff_note = COALESCE($2, staff_note), updated_at = now() WHERE id = $3`,
+    [status || null, staffNote ?? null, req.params.id]
+  );
+  const { rows: updatedRows } = await pool.query('SELECT * FROM applications WHERE id = $1', [req.params.id]);
+  const updatedRow = updatedRows[0];
 
   if (status && status !== existing.status && STATUS_EMAIL_TEXT[status]) {
-    sendEmail(
-      updatedRow.email,
-      `MIVEA Entertainment — Application Update (${updatedRow.id})`,
-      `<p>Hi ${updatedRow.full_name},</p><p>${STATUS_EMAIL_TEXT[status]}</p>`
-    );
+    sendEmail(updatedRow.email, `MIVEA Entertainment — Application Update (${updatedRow.id})`,
+      `<p>Hi ${updatedRow.full_name},</p><p>${STATUS_EMAIL_TEXT[status]}</p>`);
   }
-
   res.json(updatedRow);
-});
+}));
 
-app.get('/api/v1/artists/all', requireAuth, (req, res) => {
-  res.json(db.prepare('SELECT * FROM artists ORDER BY created_at DESC').all());
-});
+app.get('/api/v1/artists/all', requireAuth, ah(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM artists ORDER BY created_at DESC');
+  res.json(rows);
+}));
 
-app.post('/api/v1/artists', requireAuth, (req, res) => {
+app.post('/api/v1/artists', requireAuth, ah(async (req, res) => {
   const b = req.body || {};
   if (!b.name || !b.type) return res.status(400).json({ error: 'name and type are required' });
   const id = uuidv4();
-  db.prepare(`INSERT INTO artists (id, type, name, members, debut_date, position, bio) VALUES (?,?,?,?,?,?,?)`)
-    .run(id, b.type, b.name, b.members || null, b.debut || null, b.position || null, b.bio || null);
-  res.status(201).json(db.prepare('SELECT * FROM artists WHERE id = ?').get(id));
-});
+  await pool.query(
+    'INSERT INTO artists (id, type, name, members, debut_date, position, bio) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+    [id, b.type, b.name, b.members || null, b.debut || null, b.position || null, b.bio || null]
+  );
+  const { rows } = await pool.query('SELECT * FROM artists WHERE id = $1', [id]);
+  res.status(201).json(rows[0]);
+}));
 
-app.patch('/api/v1/artists/:id', requireAuth, (req, res) => {
+app.patch('/api/v1/artists/:id', requireAuth, ah(async (req, res) => {
   const b = req.body || {};
-  const existing = db.prepare('SELECT * FROM artists WHERE id = ?').get(req.params.id);
+  const { rows: existingRows } = await pool.query('SELECT * FROM artists WHERE id = $1', [req.params.id]);
+  const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: 'Not found' });
-  db.prepare(`UPDATE artists SET type=?, name=?, members=?, debut_date=?, position=?, bio=?, updated_at=datetime('now') WHERE id=?`)
-    .run(b.type ?? existing.type, b.name ?? existing.name, b.members ?? existing.members,
-         b.debut ?? existing.debut_date, b.position ?? existing.position, b.bio ?? existing.bio, req.params.id);
-  res.json(db.prepare('SELECT * FROM artists WHERE id = ?').get(req.params.id));
-});
+  await pool.query(
+    `UPDATE artists SET type=$1, name=$2, members=$3, debut_date=$4, position=$5, bio=$6, updated_at=now() WHERE id=$7`,
+    [b.type ?? existing.type, b.name ?? existing.name, b.members ?? existing.members,
+     b.debut ?? existing.debut_date, b.position ?? existing.position, b.bio ?? existing.bio, req.params.id]
+  );
+  const { rows } = await pool.query('SELECT * FROM artists WHERE id = $1', [req.params.id]);
+  res.json(rows[0]);
+}));
 
-app.delete('/api/v1/artists/:id', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM artists WHERE id = ?').run(req.params.id);
+app.delete('/api/v1/artists/:id', requireAuth, ah(async (req, res) => {
+  await pool.query('DELETE FROM artists WHERE id = $1', [req.params.id]);
   res.status(204).end();
-});
+}));
 
-app.post('/api/v1/news', requireAuth, (req, res) => {
+app.post('/api/v1/news', requireAuth, ah(async (req, res) => {
   const b = req.body || {};
   if (!b.title || !b.tag) return res.status(400).json({ error: 'title and tag are required' });
   const id = uuidv4();
-  db.prepare(`INSERT INTO news (id, tag, title, description, published_at) VALUES (?,?,?,?,?)`)
-    .run(id, b.tag, b.title, b.desc || '', b.date || new Date().toISOString());
-  res.status(201).json(db.prepare('SELECT * FROM news WHERE id = ?').get(id));
-});
+  await pool.query(
+    'INSERT INTO news (id, tag, title, description, published_at) VALUES ($1,$2,$3,$4,$5)',
+    [id, b.tag, b.title, b.desc || '', b.date || new Date().toISOString()]
+  );
+  const { rows } = await pool.query('SELECT * FROM news WHERE id = $1', [id]);
+  res.status(201).json(rows[0]);
+}));
 
-app.patch('/api/v1/news/:id', requireAuth, (req, res) => {
+app.patch('/api/v1/news/:id', requireAuth, ah(async (req, res) => {
   const b = req.body || {};
-  const existing = db.prepare('SELECT * FROM news WHERE id = ?').get(req.params.id);
+  const { rows: existingRows } = await pool.query('SELECT * FROM news WHERE id = $1', [req.params.id]);
+  const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: 'Not found' });
-  db.prepare(`UPDATE news SET tag=?, title=?, description=?, published_at=? WHERE id=?`)
-    .run(b.tag ?? existing.tag, b.title ?? existing.title, b.desc ?? existing.description,
-         b.date ?? existing.published_at, req.params.id);
-  res.json(db.prepare('SELECT * FROM news WHERE id = ?').get(req.params.id));
-});
+  await pool.query(
+    'UPDATE news SET tag=$1, title=$2, description=$3, published_at=$4 WHERE id=$5',
+    [b.tag ?? existing.tag, b.title ?? existing.title, b.desc ?? existing.description,
+     b.date ?? existing.published_at, req.params.id]
+  );
+  const { rows } = await pool.query('SELECT * FROM news WHERE id = $1', [req.params.id]);
+  res.json(rows[0]);
+}));
 
-app.delete('/api/v1/news/:id', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM news WHERE id = ?').run(req.params.id);
+app.delete('/api/v1/news/:id', requireAuth, ah(async (req, res) => {
+  await pool.query('DELETE FROM news WHERE id = $1', [req.params.id]);
   res.status(204).end();
-});
+}));
 
-app.get('/api/v1/contact-messages', requireAuth, (req, res) => {
-  res.json(db.prepare('SELECT * FROM contact_messages ORDER BY created_at DESC').all());
-});
+app.get('/api/v1/contact-messages', requireAuth, ah(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM contact_messages ORDER BY created_at DESC');
+  res.json(rows);
+}));
 
-app.patch('/api/v1/contact-messages/:id', requireAuth, (req, res) => {
-  const existing = db.prepare('SELECT * FROM contact_messages WHERE id = ?').get(req.params.id);
-  if (!existing) return res.status(404).json({ error: 'Not found' });
-  db.prepare('UPDATE contact_messages SET read = 1 WHERE id = ?').run(req.params.id);
-  res.json(db.prepare('SELECT * FROM contact_messages WHERE id = ?').get(req.params.id));
-});
+app.patch('/api/v1/contact-messages/:id', requireAuth, ah(async (req, res) => {
+  const { rows: existingRows } = await pool.query('SELECT * FROM contact_messages WHERE id = $1', [req.params.id]);
+  if (!existingRows[0]) return res.status(404).json({ error: 'Not found' });
+  await pool.query('UPDATE contact_messages SET read = true WHERE id = $1', [req.params.id]);
+  const { rows } = await pool.query('SELECT * FROM contact_messages WHERE id = $1', [req.params.id]);
+  res.json(rows[0]);
+}));
 
-app.get('/api/v1/staff', requireAuth, requireRole('administrator'), (req, res) => {
-  res.json(db.prepare('SELECT id, name, email, role, created_at FROM staff').all());
-});
+app.get('/api/v1/staff', requireAuth, requireRole('administrator'), ah(async (req, res) => {
+  const { rows } = await pool.query('SELECT id, name, email, role, created_at FROM staff');
+  res.json(rows);
+}));
 
-app.post('/api/v1/staff', requireAuth, requireRole('administrator'), (req, res) => {
+app.post('/api/v1/staff', requireAuth, requireRole('administrator'), ah(async (req, res) => {
   const b = req.body || {};
   if (!b.name || !b.email || !b.password || !b.role) {
     return res.status(400).json({ error: 'name, email, password, and role are required' });
@@ -342,17 +353,28 @@ app.post('/api/v1/staff', requireAuth, requireRole('administrator'), (req, res) 
   if (!['administrator', 'reviewer', 'editor'].includes(b.role)) {
     return res.status(400).json({ error: 'Invalid role' });
   }
-  if (db.prepare('SELECT id FROM staff WHERE email = ?').get(b.email)) {
-    return res.status(409).json({ error: 'A staff account with this email already exists' });
-  }
+  const { rows: existingRows } = await pool.query('SELECT id FROM staff WHERE email = $1', [b.email]);
+  if (existingRows[0]) return res.status(409).json({ error: 'A staff account with this email already exists' });
   const id = uuidv4();
   const hash = bcrypt.hashSync(b.password, 10);
-  db.prepare('INSERT INTO staff (id, name, email, password_hash, role) VALUES (?,?,?,?,?)')
-    .run(id, b.name, b.email, hash, b.role);
+  await pool.query('INSERT INTO staff (id, name, email, password_hash, role) VALUES ($1,$2,$3,$4,$5)',
+    [id, b.name, b.email, hash, b.role]);
   res.status(201).json({ id, name: b.name, email: b.email, role: b.role });
+}));
+
+// Fallback error handler for anything the wrapper above catches.
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`MIVEA reference API listening on http://localhost:${PORT}`);
-  if (isNewDb) console.log('New database created — run "npm run seed" to add a demo staff login.');
-});
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`MIVEA reference API listening on http://localhost:${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialize database:', err);
+    process.exit(1);
+  });
