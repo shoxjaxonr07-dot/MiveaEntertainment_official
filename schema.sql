@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS applications (
   strengths     TEXT NOT NULL,
   experience    TEXT,
   languages     TEXT NOT NULL,
+  lang          TEXT NOT NULL DEFAULT 'en' CHECK (lang IN ('en','uz')),
   status        TEXT NOT NULL DEFAULT 'SUBMITTED'
                 CHECK (status IN ('SUBMITTED','UNDER_REVIEW','SHORTLISTED',
                                    'ONLINE_AUDITION','FINAL_EVALUATION','ACCEPTED','NOT_SELECTED')),
@@ -73,3 +74,4 @@ CREATE TABLE IF NOT EXISTS contact_messages (
   read        BOOLEAN NOT NULL DEFAULT false,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
