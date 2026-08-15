@@ -1,4 +1,4 @@
- /**
+/**
  * MIVEA Entertainment — reference API server (PostgreSQL edition)
  * Express + pg (node-postgres). Data now persists across restarts/redeploys —
  * this replaces the earlier SQLite version.
@@ -86,12 +86,43 @@ async function sendEmail(to, subject, html) {
 }
 
 const STATUS_EMAIL_TEXT = {
-  UNDER_REVIEW: "Your application is now under review by our casting team.",
-  SHORTLISTED: "Congratulations — you've been shortlisted!",
-  ONLINE_AUDITION: "You've been invited to an online audition round.",
-  FINAL_EVALUATION: "Your application has reached final evaluation.",
-  ACCEPTED: "Congratulations — you've been accepted!",
-  NOT_SELECTED: "Thank you for auditioning. We won't be moving forward with your application at this time."
+  en: {
+    UNDER_REVIEW: "Your application is now under review by our casting team.",
+    SHORTLISTED: "Congratulations — you've been shortlisted!",
+    ONLINE_AUDITION: "You've been invited to an online audition round.",
+    FINAL_EVALUATION: "Your application has reached final evaluation.",
+    ACCEPTED: "Congratulations — you've been accepted!",
+    NOT_SELECTED: "Thank you for auditioning. We won't be moving forward with your application at this time."
+  },
+  uz: {
+    UNDER_REVIEW: "Arizangiz endi kasting jamoamiz tomonidan ko'rib chiqilmoqda.",
+    SHORTLISTED: "Tabriklaymiz — siz tanlanganlar ro'yxatiga kiritildingiz!",
+    ONLINE_AUDITION: "Siz onlayn kasting bosqichiga taklif qilindingiz.",
+    FINAL_EVALUATION: "Arizangiz yakuniy baholash bosqichiga yetdi.",
+    ACCEPTED: "Tabriklaymiz — siz qabul qilindingiz!",
+    NOT_SELECTED: "Kasting o'tganingiz uchun rahmat. Hozircha arizangiz bilan davom eta olmaymiz."
+  }
+};
+
+const EMAIL_TEXT = {
+  en: {
+    confirmSubject: "MIVEA Entertainment — Application Received",
+    confirmBody: (name, id) => `<p>Hi ${name},</p>
+     <p>Thank you for auditioning for MIVEA Entertainment. Your application has been received.</p>
+     <p><b>Your Application ID: ${id}</b></p>
+     <p>Keep this ID safe — you'll need it along with your email to check your status.</p>`,
+    updateSubject: (id) => `MIVEA Entertainment — Application Update (${id})`,
+    updateBody: (name, text) => `<p>Hi ${name},</p><p>${text}</p>`
+  },
+  uz: {
+    confirmSubject: "MIVEA Entertainment — Ariza qabul qilindi",
+    confirmBody: (name, id) => `<p>Assalomu alaykum, ${name},</p>
+     <p>MIVEA Entertainment'da kasting o'tganingiz uchun rahmat. Arizangiz qabul qilindi.</p>
+     <p><b>Ariza raqamingiz: ${id}</b></p>
+     <p>Bu raqamni saqlab qo'ying — holatingizni tekshirish uchun email manzilingiz bilan birga kerak bo'ladi.</p>`,
+    updateSubject: (id) => `MIVEA Entertainment — Ariza holati yangilandi (${id})`,
+    updateBody: (name, text) => `<p>Assalomu alaykum, ${name},</p><p>${text}</p>`
+  }
 };
 
 /* ---------------- RATE LIMITING ---------------- */
@@ -141,26 +172,21 @@ app.post('/api/v1/applications', rateLimit(10, 60 * 60 * 1000), ah(async (req, r
   }
   if (!CATEGORY_KEYS.includes(b.category)) return res.status(400).json({ error: 'Invalid category' });
   if (!b.video) return res.status(400).json({ error: 'Audition video is required' });
+  const lang = b.lang === 'uz' ? 'uz' : 'en';
 
   const id = genAppId();
   await pool.query(
     `INSERT INTO applications
       (id, full_name, stage_name, date_of_birth, country, city, email, phone, category,
-       photo_url, video_url, video2_url, portfolio_url, why_mivea, strengths, experience, languages)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+       photo_url, video_url, video2_url, portfolio_url, why_mivea, strengths, experience, languages, lang)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
     [id, b.fullName, b.stageName || null, b.dob, b.country, b.city || null, b.email, b.phone || null,
      b.category, b.photo || null, b.video, b.video2 || null, b.portfolio || null, b.why, b.strengths,
-     b.experience || null, b.languages]
+     b.experience || null, b.languages, lang]
   );
 
-  sendEmail(
-    b.email,
-    'MIVEA Entertainment — Application Received',
-    `<p>Hi ${b.fullName},</p>
-     <p>Thank you for auditioning for MIVEA Entertainment. Your application has been received.</p>
-     <p><b>Your Application ID: ${id}</b></p>
-     <p>Keep this ID safe — you'll need it along with your email to check your status.</p>`
-  );
+  const et = EMAIL_TEXT[lang];
+  sendEmail(b.email, et.confirmSubject, et.confirmBody(b.fullName, id));
 
   res.status(201).json({ id });
 }));
@@ -253,9 +279,13 @@ app.patch('/api/v1/applications/:id', requireAuth, ah(async (req, res) => {
   const { rows: updatedRows } = await pool.query('SELECT * FROM applications WHERE id = $1', [req.params.id]);
   const updatedRow = updatedRows[0];
 
-  if (status && status !== existing.status && STATUS_EMAIL_TEXT[status]) {
-    sendEmail(updatedRow.email, `MIVEA Entertainment — Application Update (${updatedRow.id})`,
-      `<p>Hi ${updatedRow.full_name},</p><p>${STATUS_EMAIL_TEXT[status]}</p>`);
+  if (status && status !== existing.status) {
+    const lang = updatedRow.lang === 'uz' ? 'uz' : 'en';
+    const statusText = STATUS_EMAIL_TEXT[lang][status];
+    if (statusText) {
+      const et = EMAIL_TEXT[lang];
+      sendEmail(updatedRow.email, et.updateSubject(updatedRow.id), et.updateBody(updatedRow.full_name, statusText));
+    }
   }
   res.json(updatedRow);
 }));
@@ -270,8 +300,8 @@ app.post('/api/v1/artists', requireAuth, ah(async (req, res) => {
   if (!b.name || !b.type) return res.status(400).json({ error: 'name and type are required' });
   const id = uuidv4();
   await pool.query(
-    'INSERT INTO artists (id, type, name, members, debut_date, position, bio) VALUES ($1,$2,$3,$4,$5,$6,$7)',
-    [id, b.type, b.name, b.members || null, b.debut || null, b.position || null, b.bio || null]
+    'INSERT INTO artists (id, type, name, photo_url, members, debut_date, position, bio) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+    [id, b.type, b.name, b.photo || null, b.members || null, b.debut || null, b.position || null, b.bio || null]
   );
   const { rows } = await pool.query('SELECT * FROM artists WHERE id = $1', [id]);
   res.status(201).json(rows[0]);
@@ -283,8 +313,8 @@ app.patch('/api/v1/artists/:id', requireAuth, ah(async (req, res) => {
   const existing = existingRows[0];
   if (!existing) return res.status(404).json({ error: 'Not found' });
   await pool.query(
-    `UPDATE artists SET type=$1, name=$2, members=$3, debut_date=$4, position=$5, bio=$6, updated_at=now() WHERE id=$7`,
-    [b.type ?? existing.type, b.name ?? existing.name, b.members ?? existing.members,
+    `UPDATE artists SET type=$1, name=$2, photo_url=$3, members=$4, debut_date=$5, position=$6, bio=$7, updated_at=now() WHERE id=$8`,
+    [b.type ?? existing.type, b.name ?? existing.name, b.photo ?? existing.photo_url, b.members ?? existing.members,
      b.debut ?? existing.debut_date, b.position ?? existing.position, b.bio ?? existing.bio, req.params.id]
   );
   const { rows } = await pool.query('SELECT * FROM artists WHERE id = $1', [req.params.id]);
