@@ -1,7 +1,4 @@
--- SQLite version of the schema described in BACKEND-DESIGN.md.
--- (SQLite lacks native UUID/JSONB/TIMESTAMPTZ types, so those columns
--- are stored as TEXT here. Swap this file for the Postgres version in
--- the design doc when moving to production.)
+-- PostgreSQL schema (persistent — replaces the SQLite version).
 
 CREATE TABLE IF NOT EXISTS staff (
   id            TEXT PRIMARY KEY,
@@ -9,7 +6,7 @@ CREATE TABLE IF NOT EXISTS staff (
   email         TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL CHECK (role IN ('administrator','reviewer','editor')),
-  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS applications (
@@ -34,8 +31,8 @@ CREATE TABLE IF NOT EXISTS applications (
                 CHECK (status IN ('SUBMITTED','UNDER_REVIEW','SHORTLISTED',
                                    'ONLINE_AUDITION','FINAL_EVALUATION','ACCEPTED','NOT_SELECTED')),
   staff_note    TEXT,
-  submitted_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  submitted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_applications_status   ON applications(status);
 CREATE INDEX IF NOT EXISTS idx_applications_category ON applications(category);
@@ -51,9 +48,9 @@ CREATE TABLE IF NOT EXISTS artists (
   photo_url    TEXT,
   discography  TEXT DEFAULT '[]',
   music_videos TEXT DEFAULT '[]',
-  published    INTEGER NOT NULL DEFAULT 1,
-  created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  published    BOOLEAN NOT NULL DEFAULT true,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS news (
@@ -63,8 +60,8 @@ CREATE TABLE IF NOT EXISTS news (
   cover_url     TEXT,
   description   TEXT NOT NULL,
   body          TEXT,
-  published     INTEGER NOT NULL DEFAULT 1,
-  published_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  published     BOOLEAN NOT NULL DEFAULT true,
+  published_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS contact_messages (
@@ -73,18 +70,6 @@ CREATE TABLE IF NOT EXISTS contact_messages (
   email       TEXT NOT NULL,
   subject     TEXT,
   message     TEXT NOT NULL,
-  read        INTEGER NOT NULL DEFAULT 0,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS files (
-  id            TEXT PRIMARY KEY,
-  owner_type    TEXT NOT NULL CHECK (owner_type IN ('application','artist','news')),
-  owner_id      TEXT NOT NULL,
-  field         TEXT NOT NULL,
-  storage_key   TEXT NOT NULL,
-  original_name TEXT,
-  mime_type     TEXT,
-  size_bytes    INTEGER,
-  uploaded_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  read        BOOLEAN NOT NULL DEFAULT false,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
