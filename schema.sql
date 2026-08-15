@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS applications (
   submitted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Safe migration: if the applications table already existed from an
+-- earlier deploy (before the "lang" column existed), add it now without
+-- losing any data. No-op on a fresh install where CREATE TABLE already
+-- included it.
+ALTER TABLE applications ADD COLUMN IF NOT EXISTS lang TEXT NOT NULL DEFAULT 'en';
+
 CREATE INDEX IF NOT EXISTS idx_applications_status   ON applications(status);
 CREATE INDEX IF NOT EXISTS idx_applications_category ON applications(category);
 
